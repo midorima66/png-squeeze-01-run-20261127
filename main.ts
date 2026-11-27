@@ -14,6 +14,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync, inflateSync, constants } from 'node:zlib';
+import { opDeflate } from './opd.mjs';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -351,9 +352,9 @@ function filtered(samples, width, height, bpp, choice, bruteLevel = BRUTE_LEVEL)
 }
 
 const FILTERS = {
-  palette: [0],
-  paletteByLuminance: [0, 'minsum', 'brute', 'bruteL9'],
-  channels: [0, 1, 2, 4, 'minsum', 'pairs', 'brute', 'bruteL9'],
+  palette: [0, 'minsum', 'pairs'],
+  paletteByLuminance: [0, 'minsum', 'pairs'],
+  channels: [0, 4, 'minsum', 'pairs', 'brute'],
 };
 
 const Z9 = { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY };
@@ -361,8 +362,9 @@ const Z98 = { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const Z9F = { level: 9, memLevel: 9, strategy: constants.Z_FILTERED };
 const Z98F = { level: 9, memLevel: 8, strategy: constants.Z_FILTERED };
 const Z68 = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
-// zlib settings tried on the finalists, in order.
-const PORTFOLIO = [Z98, Z9, Z98F, Z9F, Z68];
+// zlib settings tried on the finalist stream, in order (the screened stream
+// itself was produced with Z68, the screening setting).
+const PORTFOLIO = [Z98, Z9, Z98F, Z9F];
 
 function chunkBytes(form) {
   return (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
@@ -390,23 +392,44 @@ export function encode(rgba, width, height) {
     const chunks = chunkBytes(form);
     for (const choice of choices) {
       const data = filtered(form.samples, width, height, form.bpp, choice);
-      const zlib = deflateSync(data, Z98);
+      const zlib = deflateSync(data, Z68);
       const bytes = 57 + chunks + zlib.length;
       detail.push({ form: fi, colourType: form.colourType, choice: String(choice), bytes });
       screened.push({ bytes, form, data, zlib, choice, fi });
     }
   }
   screened.sort((a, b) => a.bytes - b.bytes);
-  // Run the zlib portfolio over the two best screened candidates; keep the global best.
+  // Run the zlib portfolio over the best screened candidate (fallback winner).
   let best = screened[0];
-  for (const cand of screened.slice(0, 2)) {
-    for (const opt of PORTFOLIO) {
-      if (opt === Z98) continue; // already the screened stream
-      const zlib = deflateSync(cand.data, opt);
-      const bytes = 57 + chunkBytes(cand.form) + zlib.length;
+  for (const opt of PORTFOLIO) {
+    const zlib = deflateSync(best.data, opt);
+    const bytes = 57 + chunkBytes(best.form) + zlib.length;
+    if (bytes < best.bytes) {
+      best = { bytes, form: best.form, data: best.data, zlib, choice: best.choice, fi: best.fi };
+      detail.push({ form: best.fi, colourType: best.form.colourType, choice: String(best.choice) + '+portfolio', bytes });
+    }
+  }
+  // Optimal-parse deflate (opd.mjs) on the best screened stream; keep it only
+  // when its output inflates back to the exact stream and is smaller.
+  // Time-safety policy (deterministic, from the input alone): the full parse is
+  // the entry's main runtime cost, and its yield is negligible in two measured
+  // regimes, so it is skipped there — (a) the portfolio PNG is already tiny
+  // (<= 20,000 bytes: observed opd gain <= 151 bytes), and (b) a very long
+  // stream (>= 3,000,000 bytes) that zlib already squeezes below 2% of its
+  // length (observed opd gain < 1%). On long streams the match search is
+  // capped at chain 256 (observed cost vs chain 1024: <= 787 bytes on one
+  // stream, <= 53 bytes on the others); short streams keep chain 1024, where
+  // deep search is cheap in absolute time and worth up to 676 bytes.
+  const streamLen = best.data.length;
+  const skipOpd = best.bytes <= 20000 || (streamLen >= 3000000 && best.bytes * 50 < streamLen);
+  if (!skipOpd) {
+    const opd = opDeflate(best.data, { iterations: 2, blockSize: 1 << 18, maxChain: streamLen <= 1000000 ? 1024 : 256 });
+    const verified = inflateSync(opd, { maxOutputLength: best.data.length + 1 });
+    if (verified.length === best.data.length && verified.every((v, i) => v === best.data[i])) {
+      const bytes = 57 + chunkBytes(best.form) + opd.length;
+      detail.push({ form: best.fi, colourType: best.form.colourType, choice: String(best.choice) + '+opd', bytes });
       if (bytes < best.bytes) {
-        best = { bytes, form: cand.form, data: cand.data, zlib, choice: cand.choice, fi: cand.fi };
-        detail.push({ form: cand.fi, colourType: cand.form.colourType, choice: String(cand.choice) + '+portfolio', bytes });
+        return { png: pngOfForm(width, height, best.form, opd), detail, best: { ...best, bytes, zlib: opd } };
       }
     }
   }
